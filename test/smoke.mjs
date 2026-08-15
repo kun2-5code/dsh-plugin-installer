@@ -2,7 +2,7 @@
 // 半侧（webServer 路由 + API 方法 + 免重启热激活）。
 // 运行：node test/smoke.mjs（先 pnpm build）
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { name, apply } from '../lib/index.js'
@@ -203,6 +203,99 @@ assert.doesNotThrow(() => apply({}), 'carrier apply should be a no-op')
     // 3) 无根 include（非 profile 树 / 无 Loader）：返回 false（调用方回退为"需重启"）。
     const noTree = await hotApplyInstall({ entries: () => [] }, profileDir, ['dsh-fake-plugin'])
     assert.equal(noTree, false, 'hotApplyInstall without a root include should report not-applied')
+  } finally {
+    rmSync(profileDir, { recursive: true, force: true })
+  }
+}
+
+// 禁用/启用（set-enabled）：在 profile 的 cordis.patch.yml 里维护托管块
+//（持久化 + HMR 热应用）；内置 @deepseek-ai/* 拒绝操作。
+{
+  const profileDir = mkdtempSync(join(tmpdir(), 'dsh-set-enabled-'))
+  try {
+    writeFileSync(join(profileDir, 'package.json'), JSON.stringify({
+      name: 'dsh-profile-toggle',
+      private: true,
+      dependencies: {},
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-fake-plugin'] } },
+    }, undefined, 2) + '\n')
+
+    // 假 bundle 包：一个 insert 行 fake-row。
+    const fakePkgDir = join(profileDir, 'node_modules', 'dsh-fake-plugin')
+    mkdirSync(fakePkgDir, { recursive: true })
+    writeFileSync(join(fakePkgDir, 'package.json'), JSON.stringify({
+      name: 'dsh-fake-plugin',
+      version: '0.1.0',
+      dsh: { bundle: { patch: './cordis.patch.yml' } },
+    }))
+    writeFileSync(join(fakePkgDir, 'cordis.patch.yml'), [
+      '- insert:',
+      '    - id: fake-row',
+      '      name: dsh-fake-plugin',
+      '',
+    ].join('\n'))
+
+    const patchPath = join(profileDir, 'cordis.patch.yml')
+    const loaderFor = (rowDisabled) => ({
+      entries: () => [
+        { options: { id: 'include', name: 'cordis:include' } },
+        { options: { id: 'fake-row', name: 'dsh-fake-plugin', disabled: rowDisabled } },
+      ],
+    })
+
+    // 1) 禁用：写入托管块；loader 条目立即显示 disabled → hot true。
+    const disabled = await handleInstallerRequest(profileDir, {
+      method: 'set-enabled', packageName: 'dsh-fake-plugin', enabled: false,
+    }, loaderFor(true))
+    assert.equal(disabled.ok, true)
+    if (!disabled.ok) throw new Error('unreachable')
+    assert.equal(disabled.value.hot, true)
+    assert.deepEqual(disabled.value.toggled, ['fake-row'])
+    const patched = readFileSync(patchPath, 'utf8')
+    assert.ok(patched.includes('- id: fake-row'), 'managed block should carry the row id')
+    assert.ok(patched.includes('disabled: true'), 'managed block should disable the row')
+
+    // 2) list：loader 条目 disabled → bundle 显示 已禁用（且仍 active）。
+    const listed = await handleInstallerRequest(profileDir, { method: 'list' }, loaderFor(true))
+    assert.equal(listed.ok, true)
+    if (!listed.ok) throw new Error('unreachable')
+    const view = listed.value.bundles.find((b) => b.packageName === 'dsh-fake-plugin')
+    assert.equal(view.disabled, true, 'bundle should report disabled')
+    assert.equal(view.active, true, 'disabled rows still count as mounted')
+
+    // 3) 启用：清空托管块（文件退回合法空数组 []）。
+    const enabled = await handleInstallerRequest(profileDir, {
+      method: 'set-enabled', packageName: 'dsh-fake-plugin', enabled: true,
+    }, loaderFor(false))
+    assert.equal(enabled.ok, true)
+    if (!enabled.ok) throw new Error('unreachable')
+    assert.equal(enabled.value.hot, true)
+    assert.deepEqual(enabled.value.toggled, ['fake-row'])
+    assert.equal(readFileSync(patchPath, 'utf8').trim(), '[]', 'empty managed state should leave a valid empty array')
+
+    // 4) 内置保护：@deepseek-ai/* 拒绝。
+    const builtin = await handleInstallerRequest(profileDir, {
+      method: 'set-enabled', packageName: '@deepseek-ai/dsh-base', enabled: false,
+    }, loaderFor(true))
+    assert.equal(builtin.ok, false)
+    if (builtin.ok) throw new Error('unreachable')
+    assert.equal(builtin.error.code, 'builtin-protected')
+
+    // 5) 用户内容保留：托管块插入/移除不破坏文件其余内容。
+    writeFileSync(patchPath, [
+      '# 用户自己的补丁',
+      '- id: user-row',
+      '  disabled: true',
+      '',
+    ].join('\n'))
+    const disabled2 = await handleInstallerRequest(profileDir, {
+      method: 'set-enabled', packageName: 'dsh-fake-plugin', enabled: false,
+    }, loaderFor(true))
+    assert.equal(disabled2.ok, true)
+    const preserved = readFileSync(patchPath, 'utf8')
+    assert.ok(preserved.includes('# 用户自己的补丁'), 'user comments should be preserved')
+    assert.ok(preserved.includes('- id: user-row'), 'user patches should be preserved')
+    assert.ok(preserved.includes('- id: fake-row'), 'managed block should be appended')
   } finally {
     rmSync(profileDir, { recursive: true, force: true })
   }

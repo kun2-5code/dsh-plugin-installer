@@ -20,7 +20,7 @@ dsh-plugin-installer/
 ├── dev/cordis.yml      # local dev overlay (points at source; use with dsh web --patch; host half only)
 ├── src/
 │   ├── index.ts        # package-name entry (client-half discovery carrier): no-op, host side does nothing
-│   ├── installer.ts    # host half of the plugin installer: webServer route → pnpm add/remove + bundle reconcile + no-restart hot activation
+│   ├── installer.ts    # host half of the plugin installer: webServer route → pnpm add/remove + bundle reconcile + no-restart hot activation + disable/enable
 │   ├── client.ts       # browser half entry: registers the 安装 tab in the settings.plugins.tab slot
 │   └── installer-client.ts  # the Install tab's React implementation (same-origin fetch to the host API)
 └── test/smoke.mjs      # smoke test on the build output (routes + API methods + hot activation)
@@ -82,6 +82,12 @@ node test/smoke.mjs
 ```
 
 Install sources: npm package names (`dsh-my-plugin`), `github:user/repo`, `file:` links, and **absolute** paths to local directories/tarballs (relative paths are rejected — the browser has no working directory to anchor them to).
+
+### Disable / enable
+
+Every **non-built-in** bundle row gets a 禁用/启用 (disable/enable) button: the installer keeps a marker-delimited managed block (`# >>> dsh-plugin-installer: managed …`) in the profile's `cordis.patch.yml`, writing `{ id, disabled: true/false }` overrides for each of the bundle's config rows. That file is both the persistence (composed into the config tree at boot as the user layer) and the hot-reload entry point (dsh's config HMR watches it), so disable/enable is also **restart-free**. Badge states: 运行中 (running) / 已禁用 (disabled) / 需重启 (needs restart).
+
+Built-in bundles (`@deepseek-ai/*` — the harness core `dsh-base` and the GUI itself `dsh-web-app`) carry an 内置 (built-in) badge and are **not open to disable or removal**: they are not profile dependencies, and disabling/removing them breaks the profile. To fine-control built-in features (e.g. disable one of their tool rows), edit the profile's `cordis.patch.yml` directly and write `disabled: true` on the target row.
 
 ### No-restart installs/uninstalls (hot activation)
 

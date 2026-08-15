@@ -20,7 +20,7 @@ dsh-plugin-installer/
 ├── dev/cordis.yml      # 本地开发 overlay（指向源码，配合 dsh web --patch；仅 host 半边）
 ├── src/
 │   ├── index.ts        # 包名入口（client 半边发现载体）：空实现，host 侧无事可做
-│   ├── installer.ts    # 安装器宿主半侧：webServer 路由 → pnpm add/remove + bundle 层对账 + 免重启热激活
+│   ├── installer.ts    # 安装器宿主半侧：webServer 路由 → pnpm add/remove + bundle 层对账 + 免重启热激活 + 禁用/启用
 │   ├── client.ts       # 浏览器半边入口：在 settings.plugins.tab 插槽注册「安装」tab
 │   └── installer-client.ts  # 安装 tab 的 React 实现（同源 fetch 调宿主 API）
 └── test/smoke.mjs      # 构建产物冒烟测试（路由 + API 方法 + 热激活）
@@ -82,6 +82,12 @@ node test/smoke.mjs
 ```
 
 安装源支持：npm 包名（`dsh-my-plugin`）、`github:user/repo`、`file:` 链接、本地目录/tarball 的**绝对路径**（相对路径会被拒绝——浏览器没有可锚定的工作目录）。
+
+### 禁用 / 启用
+
+每个**非内置** bundle 行都有「禁用 / 启用」按钮：安装器在 profile 的 `cordis.patch.yml` 里维护一段带标记的托管块（`# >>> dsh-plugin-installer: managed …`），对 bundle 的每个配置行写 `{ id, disabled: true/false }` 覆盖。这个文件既是持久化（启动时作为用户层组合进配置树）也是热重载入口（dsh 的配置 HMR 监听它），所以禁用/启用**同样免重启**。徽标三态：**运行中 / 已禁用 / 需重启**。
+
+内置 bundle（`@deepseek-ai/*`，即 harness 核心 `dsh-base`、GUI 本身 `dsh-web-app`）带「内置」徽标，**不开放禁用和卸载**——它们不是 profile 的依赖，卸载/禁用会让 profile 无法启动。想精细控制内置功能（如禁用其中某个工具行），请直接编辑 profile 的 `cordis.patch.yml`，对目标行写 `disabled: true`。
 
 ### 免重启：安装/卸载即时生效
 

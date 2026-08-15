@@ -34,15 +34,17 @@ export const name = 'dsh-plugin-installer/installer'
 // ---- 类型：请求 / 响应契约（与客户端 src/installer-client.tsx 共享形状）----
 
 /** 一次 API 请求的方法。 */
-export type InstallerMethod = 'list' | 'install' | 'remove'
+export type InstallerMethod = 'list' | 'install' | 'remove' | 'set-enabled'
 
 /** HTTP API 请求体。 */
 export interface InstallerRequest {
   method: InstallerMethod
   /** install 用：npm 包名 / github:user/repo / file: 链接 / tarball 或目录的绝对路径。 */
   spec?: string
-  /** remove 用：已安装的包名。 */
+  /** remove / set-enabled 用：已安装的包名。 */
   packageName?: string
+  /** set-enabled 用：true = 启用，false = 禁用。 */
+  enabled?: boolean
 }
 
 /** 错误码 → 语义；客户端据此渲染提示。 */
@@ -51,6 +53,8 @@ export type InstallerErrorCode =
   | 'relative-path'
   | 'install-failed'
   | 'remove-failed'
+  | 'set-enabled-failed'
+  | 'builtin-protected'
   | 'method-not-found'
   | 'pnpm-missing'
   | 'internal'
@@ -77,6 +81,8 @@ export interface BundleView {
   patch?: string
   /** 是否已挂载进当前运行的 Loader（false = 需要重启 dsh 生效）。 */
   active: boolean
+  /** 是否整包禁用（其全部 insert 行在运行树中均为 disabled）。 */
+  disabled?: boolean
 }
 
 /** list 返回的一个依赖视图。 */
@@ -96,7 +102,7 @@ export interface InstallerListValue {
   dependencies: DependencyView[]
 }
 
-/** install / remove 方法的值。 */
+/** install / remove / set-enabled 方法的值。 */
 export interface InstallerChangeValue {
   output: string
   /** 本次新增的依赖名（install）。 */
@@ -105,6 +111,8 @@ export interface InstallerChangeValue {
   activated?: string[]
   /** 本次移除的依赖名（remove）。 */
   removed?: string[]
+  /** set-enabled 本次切换的配置行 id（行级禁用状态落在 profile 的 cordis.patch.yml）。 */
+  toggled?: string[]
   /**
    * 本次变更是否已热应用到运行中的配置树（true = 已生效，无需重启；
    * false / 缺省 = 已落盘，重启 dsh 后生效）。
@@ -128,6 +136,7 @@ interface LoaderEntryLike {
   options: {
     id?: string
     name?: string
+    disabled?: boolean
     config?: { path?: string; patches?: unknown[] }
   }
   update?(options: { config: { path?: string; patches?: unknown[] } }): Promise<void>
@@ -391,6 +400,191 @@ export async function hotApplyRemove(
   return true
 }
 
+// ---- 禁用 / 启用（set-enabled）----
+//
+// 禁用一个 bundle = 在 profile 的 cordis.patch.yml 里对它的每个 insert 行写
+// 一条 id 覆盖补丁 `{ id, disabled: true }`（启用写 `disabled: false`）。
+// 这个文件既是持久化（启动时作为用户层组合进配置树），也是热重载入口
+// （dsh 的配置 HMR 监听它，改动即事务性应用）—— 因此禁用/启用默认免重启。
+// 安装器把这类补丁集中维护在一个带标记的托管块里，避免污染用户自己的内容：
+//
+//   # >>> dsh-plugin-installer: managed (bundle state) — 安装器维护，请勿手改
+//   - id: <row-id>
+//     disabled: true
+//   # <<< dsh-plugin-installer: managed
+//
+// 内置保护：`@deepseek-ai/*` 是 harness 核心（dsh-base / dsh-web-app 等），
+// 禁用会导致 profile 无法启动或失去 GUI，因此 set-enabled 与 remove 一样拒绝。
+
+/** profile 的 patch 文件名（与 harness 的 PROFILE_PATCH_FILENAME 一致）。 */
+const PROFILE_PATCH_FILENAME = 'cordis.patch.yml'
+
+/** 托管块起始标记行。 */
+const MANAGED_START = '# >>> dsh-plugin-installer: managed (bundle state) — 安装器维护，请勿手改'
+/** 托管块结束标记行。 */
+const MANAGED_END = '# <<< dsh-plugin-installer: managed'
+
+/** 收集一个 bundle patch 文件里所有 insert 出的顶层行 id（禁用单位）。 */
+function collectInsertRowIds(patches: readonly Record<string, unknown>[]): string[] {
+  const ids: string[] = []
+  for (const patch of patches) {
+    const insert = patch.insert
+    if (!Array.isArray(insert)) continue
+    for (const row of insert) {
+      if (row !== null && typeof row === 'object' && typeof (row as Record<string, unknown>).id === 'string') {
+        ids.push((row as Record<string, unknown>).id as string)
+      }
+    }
+  }
+  return ids
+}
+
+/** 从文件内容中切出托管块（标记之间的文本）；无标记时缺省。 */
+function extractManagedBlock(content: string): string | undefined {
+  const start = content.indexOf(MANAGED_START)
+  const end = content.indexOf(MANAGED_END)
+  if (start < 0 || end < start) return undefined
+  return content.slice(start + MANAGED_START.length, end)
+}
+
+/** 读当前托管状态：行 id → 是否禁用（文件不存在/无托管块时为空）。 */
+function readManagedState(profileDir: string): Map<string, boolean> {
+  const path = join(profileDir, PROFILE_PATCH_FILENAME)
+  if (!existsSync(path)) return new Map()
+  const block = extractManagedBlock(readFileSync(path, 'utf8'))
+  if (block === undefined) return new Map()
+  const parsed = yaml.load(block, { schema: entryListSchema })
+  const state = new Map<string, boolean>()
+  if (Array.isArray(parsed)) {
+    for (const entry of parsed) {
+      if (entry !== null && typeof entry === 'object') {
+        const record = entry as Record<string, unknown>
+        if (typeof record.id === 'string' && typeof record.disabled === 'boolean') {
+          state.set(record.id, record.disabled)
+        }
+      }
+    }
+  }
+  return state
+}
+
+/** 把托管块写回 profile 的 cordis.patch.yml（保留文件其余内容；文件缺失时新建）。 */
+function writeManagedState(profileDir: string, state: Map<string, boolean>): void {
+  const path = join(profileDir, PROFILE_PATCH_FILENAME)
+  const entries = [...state].map(([id, disabled]) => ({ id, disabled }))
+  const block = entries.length === 0
+    ? null
+    : `${MANAGED_START}\n${yaml.dump(entries)}${MANAGED_END}\n`
+
+  const existing = existsSync(path) ? readFileSync(path, 'utf8') : ''
+  const trimmed = existing.trim()
+  let next: string
+  if (trimmed === '' || trimmed === '[]') {
+    // 空文件 / 空数组：整个文件就是托管块（或为空）。
+    next = block ?? '[]\n'
+  } else {
+    const start = existing.indexOf(MANAGED_START)
+    const end = existing.indexOf(MANAGED_END)
+    let base = existing
+    if (start >= 0 && end >= start) {
+      const endOfLine = existing.indexOf('\n', end)
+      const regionEnd = endOfLine === -1 ? existing.length : endOfLine + 1
+      base = existing.slice(0, start) + existing.slice(regionEnd)
+    }
+    const rest = base.trimEnd()
+    if (block === null) {
+      // 托管块被清空：剩余内容必须是合法 YAML 数组（空则写 `[]`）。
+      next = rest === '' ? '[]\n' : rest + '\n'
+    } else {
+      next = (rest === '' ? '' : rest + '\n') + block
+    }
+  }
+  writeFileSync(path, next)
+}
+
+/**
+ * set-enabled：切换一个 bundle 所有 insert 行的禁用状态（写入 profile 的
+ * cordis.patch.yml 托管块，持久化 + HMR 热应用）。
+ * @returns 是否已确认热生效；false = 需要重启（无 Loader / 非 include 树 / 更新失败）。
+ */
+async function setEnabled(
+  packageName: string,
+  enabled: boolean,
+  profileDir: string,
+  loader: LoaderLike | undefined,
+): Promise<InstallerResponse<InstallerChangeValue>> {
+  const trimmed = packageName.trim()
+  if (trimmed === '') return { ok: false, error: { code: 'bad-request', message: '包名不能为空' } }
+  if (trimmed.startsWith('@deepseek-ai/')) {
+    return {
+      ok: false,
+      error: {
+        code: 'builtin-protected',
+        message: `${trimmed} 是 harness 内置 bundle（核心 / GUI 本身），禁用或卸载会导致 profile 无法启动，因此不开放。`
+          + '如需控制内置功能，请直接编辑 profile 的 cordis.patch.yml。',
+      },
+    }
+  }
+  const patchPath = bundlePatchPath(profileDir, trimmed)
+  if (patchPath === undefined) {
+    return { ok: false, error: { code: 'set-enabled-failed', message: `${trimmed} 无法解析或未声明 dsh.bundle` } }
+  }
+  let patches: Array<Record<string, unknown>>
+  try {
+    patches = parsePatchFile(patchPath)
+  } catch (error) {
+    return { ok: false, error: { code: 'set-enabled-failed', message: `解析 ${trimmed} 的 patch 失败：${String(error)}` } }
+  }
+  const rowIds = collectInsertRowIds(patches)
+  if (rowIds.length === 0) {
+    return {
+      ok: true,
+      value: { output: '', hot: true, warning: `${trimmed} 的 patch 没有可禁用的配置行（无 insert），无需切换` },
+    }
+  }
+
+  const state = readManagedState(profileDir)
+  for (const id of rowIds) {
+    if (enabled) state.delete(id)
+    else state.set(id, true)
+  }
+  writeManagedState(profileDir, state)
+
+  const value: InstallerChangeValue = { output: '', toggled: rowIds }
+  try {
+    value.hot = await waitForEntries(loader, (entries) => {
+      const byId = new Map(entries.map((entry) => [entry.options.id, entry]))
+      // 启用：所有行在树中且未被禁用；禁用：所有行在树中且已禁用。
+      // 行不在树中（如热装后未重启的临时状态）视为未确认。
+      return rowIds.every((id) => {
+        const entry = byId.get(id)
+        return entry !== undefined && (enabled ? entry.options.disabled !== true : entry.options.disabled === true)
+      })
+    })
+    if (value.hot !== true) {
+      value.warning = '已写入 profile 的 cordis.patch.yml（重启后生效）；'
+        + '若当前未生效，可能是该 bundle 刚热装、尚未重启，或热应用未完成'
+    }
+  } catch (error) {
+    value.warning = `热应用失败（${String(error)}）—— 已写入 profile，重启后生效`
+  }
+  return { ok: true, value }
+}
+
+/** 轮询 Loader 条目直到断言成立或超时。 */
+async function waitForEntries(
+  loader: LoaderLike | undefined,
+  check: (entries: ReadonlyArray<LoaderEntryLike>) => boolean,
+): Promise<boolean> {
+  if (loader === undefined) return false
+  const deadline = Date.now() + HOT_WAIT_MS
+  while (Date.now() < deadline) {
+    if (check([...loader.entries()])) return true
+    await new Promise((resolve) => setTimeout(resolve, HOT_POLL_MS))
+  }
+  return false
+}
+
 // ---- pnpm 执行 ----
 
 /** 在 profile 目录里运行一次 pnpm，收集 stdout+stderr 与退出码。 */
@@ -426,18 +620,38 @@ function isGitSpec(spec: string): boolean {
 /** list：读 manifest 组装当前 bundle 层与依赖的视图。 */
 function list(profileDir: string, loader: LoaderLike | undefined): InstallerListValue {
   const manifest = readManifest(profileDir)
+  const entries = [...(loader?.entries() ?? [])]
   const loadedNames = new Set(
-    (loader?.entries() ?? []).map((entry) => entry.options.name).filter((n): n is string => n !== undefined),
+    entries.map((entry) => entry.options.name).filter((n): n is string => n !== undefined),
   )
-  // bundle 行名可能是包名本身（如示例主插件行）或包名子路径（如安装器行
+  const entriesById = new Map(entries.map((entry) => [entry.options.id, entry]))
+  // bundle 行名可能是包名本身（如客户端发现载体行）或包名子路径（如安装器行
   // `dsh-plugin-installer/installer`）——二者都算该 bundle 已挂载。
   const isLoaded = (packageName: string): boolean =>
     [...loadedNames].some((name) => name === packageName || name.startsWith(`${packageName}/`))
   const bundles: BundleView[] = (manifest.dsh?.profile?.bundles ?? []).map((packageName) => {
     const dir = packageDirFromAnchor(join(profileDir, 'package.json'), packageName)
     if (dir === undefined) return { packageName, resolved: false, active: false }
-    const patch = readManifest(dir).dsh?.bundle?.patch
-    return { packageName, resolved: true, ...(patch === undefined ? {} : { patch }), active: isLoaded(packageName) }
+    const bundleManifest = readManifest(dir)
+    const patch = bundleManifest.dsh?.bundle?.patch
+    const view: BundleView = {
+      packageName,
+      resolved: true,
+      ...(patch === undefined ? {} : { patch }),
+      active: isLoaded(packageName),
+    }
+    if (patch !== undefined) {
+      try {
+        const rowIds = collectInsertRowIds(parsePatchFile(join(dir, patch)))
+        if (rowIds.length > 0) {
+          // 整包禁用 = 其全部 insert 行在运行树中都是 disabled。
+          view.disabled = rowIds.every((id) => entriesById.get(id)?.options.disabled === true)
+        }
+      } catch {
+        // 解析失败（损坏的 patch）不影响列表，仅跳过 disabled 计算。
+      }
+    }
+    return view
   })
   const dependencies: DependencyView[] = Object.entries(manifest.dependencies ?? {})
     .map(([name, spec]) => ({ name, spec, isBundle: exportsPatch(name, profileDir) }))
@@ -587,6 +801,8 @@ export async function handleInstallerRequest(
       return install(request.spec ?? '', profileDir, loader)
     case 'remove':
       return remove(request.packageName ?? '', profileDir, loader)
+    case 'set-enabled':
+      return setEnabled(request.packageName ?? '', request.enabled === true, profileDir, loader)
     default:
       return {
         ok: false,

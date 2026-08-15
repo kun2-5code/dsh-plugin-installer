@@ -36,6 +36,8 @@ export interface InstallerBundle {
   resolved: boolean
   patch?: string
   active: boolean
+  /** 是否整包禁用（其全部 insert 行在运行树中均为 disabled）。 */
+  disabled?: boolean
 }
 
 export interface InstallerDependency {
@@ -56,6 +58,8 @@ export interface InstallerChange {
   added?: string[]
   activated?: string[]
   removed?: string[]
+  /** set-enabled 本次切换的配置行 id。 */
+  toggled?: string[]
   /** 是否已热应用到运行中的配置树（true = 已生效，无需重启）。 */
   hot?: boolean
   warning?: string | undefined
@@ -66,6 +70,7 @@ export interface InstallerApi {
   list(): Promise<InstallerList>
   install(spec: string): Promise<InstallerChange>
   remove(packageName: string): Promise<InstallerChange>
+  setEnabled(packageName: string, enabled: boolean): Promise<InstallerChange>
 }
 
 interface ApiErrorPayload {
@@ -105,6 +110,7 @@ export const installerApi: InstallerApi = {
   list: () => call('list', {}),
   install: (spec) => call('install', { spec }),
   remove: (packageName) => call('remove', { packageName }),
+  setEnabled: (packageName, enabled) => call('set-enabled', { packageName, enabled: String(enabled) }),
 }
 
 // ---- tab UI 状态 ----
@@ -199,15 +205,42 @@ export function InstallerTab({ api }: { api: InstallerApi }): React.ReactElement
     ).finally(() => { setBusy(undefined); forceRender() })
   }
 
+  const runToggle = (bundle: InstallerBundle): void => {
+    if (busy !== undefined) return
+    const target = bundle.disabled === true ? false : true
+    setBusy(`toggle:${bundle.packageName}`)
+    setMessage(undefined)
+    void api.setEnabled(bundle.packageName, target).then(
+      (change) => {
+        const toggled = change.toggled ?? []
+        const hot = change.hot === true
+        const label = target ? '启用' : '禁用'
+        setMessage({
+          kind: 'info',
+          text: toggled.length > 0
+            ? hot
+              ? `已${label}：${bundle.packageName}（已热生效，无需重启）`
+              : `已${label}：${bundle.packageName}（已写入 profile 的 cordis.patch.yml，重启后生效）`
+            : `无需切换：${bundle.packageName} 没有可禁用的配置行`,
+          output: change.output,
+        })
+        refresh()
+      },
+      (error: Error & { code?: string; output?: string }) => {
+        setMessage({ kind: 'error', text: error.message, output: error.output })
+      },
+    ).finally(() => { setBusy(undefined); forceRender() })
+  }
+
   return React.createElement(
     'div',
     { className: 'dsi-tab' },
     React.createElement(
       'p',
       { className: 'dsi-intro' },
-      '在 profile 里安装/卸载插件（等价于 `dsh plugin add/remove`）。',
+      '在 profile 里安装/卸载/禁用插件（等价于 `dsh plugin add/remove` + 行级 disabled）。',
       '安装源支持 npm 包名、github:user/repo、file: 链接、tarball/目录的绝对路径；',
-      '安装/卸载会热更新运行中的配置（无需重启）；热更新失败时才需要重启 dsh。',
+      '安装/卸载/禁用会热更新运行中的配置（无需重启）；热更新失败时才需要重启 dsh。',
       '需要 pnpm 在 dsh 进程的 PATH 上。',
     ),
     React.createElement(
@@ -253,7 +286,7 @@ export function InstallerTab({ api }: { api: InstallerApi }): React.ReactElement
       ? React.createElement(
         'div',
         { className: 'dsi-list' },
-        renderBundles(listState.list, busy, runRemove),
+        renderBundles(listState.list, busy, runRemove, runToggle),
         renderDependencies(listState.list),
       )
       : null,
@@ -286,23 +319,48 @@ function renderMessage(
   )
 }
 
-/** bundle 层列表：激活中的 + 未激活（需重启）的。 */
+/** bundle 层列表：运行中 / 已禁用 / 需重启 + 内置徽标 + 禁用/启用与卸载按钮。 */
 function renderBundles(
   list: InstallerList,
   busy: string | undefined,
   runRemove: (packageName: string) => void,
+  runToggle: (bundle: InstallerBundle) => void,
 ): React.ReactElement {
-  const removable = list.bundles.filter((bundle) => !bundle.packageName.startsWith('@deepseek-ai/'))
   const rows = list.bundles.map((bundle) => {
-    const activeBadge = React.createElement(
-      'span',
-      { className: bundle.active ? 'dsi-badge dsi-badge-active' : 'dsi-badge' },
-      bundle.active ? '运行中' : '需重启',
-    )
+    const isBuiltin = bundle.packageName.startsWith('@deepseek-ai/')
+    const activeBadge = !bundle.active
+      ? React.createElement('span', { className: 'dsi-badge' }, '需重启')
+      : bundle.disabled === true
+        ? React.createElement('span', { className: 'dsi-badge dsi-badge-off' }, '已禁用')
+        : React.createElement('span', { className: 'dsi-badge dsi-badge-active' }, '运行中')
     const resolvedBadge = bundle.resolved
       ? null
       : React.createElement('span', { className: 'dsi-badge dsi-badge-warn' }, '未解析')
-    const removeButton = removable.includes(bundle) && bundle.resolved
+    const builtinBadge = isBuiltin
+      ? React.createElement(
+        'span',
+        {
+          className: 'dsi-badge dsi-badge-warn',
+          title: 'harness 内置 bundle（核心 / GUI 本身），禁用或卸载会破坏 profile，故不开放',
+        },
+        '内置',
+      )
+      : null
+    const toggleButton = !isBuiltin && bundle.resolved
+      ? React.createElement(
+        'button',
+        {
+          type: 'button',
+          className: 'dsi-button',
+          disabled: busy !== undefined,
+          onClick: () => runToggle(bundle),
+        },
+        busy === `toggle:${bundle.packageName}`
+          ? '切换中…'
+          : bundle.disabled === true ? '启用' : '禁用',
+      )
+      : null
+    const removeButton = !isBuiltin && bundle.resolved
       ? React.createElement(
         'button',
         {
@@ -325,6 +383,8 @@ function renderBundles(
       ),
       activeBadge,
       resolvedBadge,
+      builtinBadge,
+      toggleButton,
       removeButton,
     )
   })
@@ -425,6 +485,7 @@ export function injectInstallerStyles(): void {
 .dsi-badge { flex: none; border-radius: 999px; padding: 1px 8px; font-size: 11px; line-height: 17px; white-space: nowrap; font-weight: 500; background: var(--dsw-alias-bg-module-platform); color: var(--dsw-alias-label-secondary); }
 .dsi-badge-active { color: var(--dsw-alias-label-primary); }
 .dsi-badge-warn { color: var(--dsw-alias-state-warning-primary, var(--dsw-alias-label-secondary)); }
+.dsi-badge-off { color: var(--dsw-alias-label-tertiary); text-decoration: line-through; }
 .dsi-empty { margin: 0; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); }
 `
   document.head.appendChild(tag)

@@ -2,16 +2,12 @@
 
 **English** | [简体中文](README.zh.md)
 
-A ready-to-run, ready-to-install starter template for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) plugins. It demonstrates the six most common plugin shapes in one minimal installable bundle:
+A **plugin installer** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`): a ready-to-install bundle that lets you install/remove profile plugins straight from the Web GUI — no terminal needed, and installs take effect **without a restart by default**.
 
-- **Config** — `Config` interface + Schemastery schema; validation and defaults apply at load time ([docs](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/config.md))
-- **Tool** — `ctx.tools.register(defineTool(...))` registers a model-callable tool ([docs](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/tool.md))
-- **Events** — `ctx.on` / `ctx.emit` with declaration merging for typed events ([docs](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/events.md))
-- **Service** — a class-form plugin that provides a service to other plugins ([docs](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/service.md))
-- **Hook** — a `tools/pre-execute` permission gate that denies tool calls by config ([docs](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/cookbook/extension-cookbook.md))
-- **Browser half (client)** — `src/client.ts` registers a **clickable config card** under Settings → Plugins → Configurable; it writes `greeting` / `maxRetries` / `verbose` into the user settings document through the settings namespace, taking effect live.
+- Host half (`src/installer.ts`) registers `POST /dsh-plugin-installer/api` on the web server — the exact same operation as `dsh plugin --profile <name> add/remove` (forwards to `pnpm` inside the profile directory + reconciles the `dsh.profile.bundles` layer stack).
+- Browser half (`src/client.ts`, with `src/installer-client.ts`) registers an **安装 (Install) tab** under Settings → Plugins: an install input, the current bundle layers with run/needs-restart badges, and per-bundle uninstall buttons.
 
-The template follows the official [bundle distribution model](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md): the package declares `dsh.bundle` plus `cordis.patch.yml`, and `dsh plugin add` activates it as a config layer.
+The package follows the official [bundle distribution model](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md): it declares `dsh.bundle` plus `cordis.patch.yml`, and `dsh plugin add` activates it as a config layer.
 
 ## Directory structure
 
@@ -20,33 +16,32 @@ dsh-plugin-installer/
 ├── package.json        # npm manifest + dsh.bundle / dsh.client declarations + prepare build script
 ├── tsconfig.json       # strict type-check configuration (tsc --noEmit)
 ├── tsdown.config.ts    # build config: Node library (lib/) + client bundle (lib/client.js), self-contained for git-install prepare
-├── cordis.patch.yml    # bundle config layer: inserts the plugin rows
+├── cordis.patch.yml    # bundle config layer: client-discovery carrier row + installer host row
 ├── dev/cordis.yml      # local dev overlay (points at source; use with dsh web --patch; host half only)
 ├── src/
-│   ├── index.ts        # main plugin: Config + tool + events + effect, config wired through the settings namespace
-│   ├── client.ts       # browser half: clickable config card (settings.plugin.item slot) + installer tab registration
-│   ├── installer.ts    # host half of the plugin installer: webServer route → pnpm add/remove + bundle reconcile
-│   ├── installer-client.ts  # browser half of the installer: Settings → Plugins → 安装 tab (same-origin fetch)
-│   ├── service.ts      # optional example: Service provider (disabled by default)
-│   └── hook.ts         # optional example: hook permission gate (disabled by default)
-└── test/smoke.mjs      # smoke test on the build output (incl. settings wiring unit test)
+│   ├── index.ts        # package-name entry (client-half discovery carrier): no-op, host side does nothing
+│   ├── installer.ts    # host half of the plugin installer: webServer route → pnpm add/remove + bundle reconcile + no-restart hot activation
+│   ├── client.ts       # browser half entry: registers the 安装 tab in the settings.plugins.tab slot
+│   └── installer-client.ts  # the Install tab's React implementation (same-origin fetch to the host API)
+└── test/smoke.mjs      # smoke test on the build output (routes + API methods + hot activation)
 ```
 
 ## Quick start
 
 ### Install as a bundle (for users)
 
-From any directory, install this package (or your fork) into a dsh profile:
+Install this package into the GUI-bearing `web` profile:
 
 ```sh
-# local directory
-dsh plugin --profile demo add /path/to/dsh-plugin-installer
+# local directory (build first: a local-directory install does not run prepare)
+cd /path/to/dsh-plugin-installer && pnpm build
+dsh plugin --profile web add /path/to/dsh-plugin-installer
 
-# or directly from GitHub (replace with your own repo after forking)
-dsh plugin --profile demo add github:you/dsh-plugin-installer
+# or directly from GitHub (a git install runs prepare automatically)
+dsh plugin --profile web add github:you/dsh-plugin-installer
 ```
 
-A GitHub install pulls **source**; pnpm runs `prepare` (i.e. `tsdown`) to build `lib/`. On pnpm ≥10 the first git-dependency prepare is refused; add the package name pnpm prints to the profile's `pnpm-workspace.yaml` and retry:
+On a GitHub install, pnpm ≥10 refuses the git dependency's `prepare` script the first time; add the package name pnpm prints to the profile's `pnpm-workspace.yaml` and retry:
 
 ```yaml
 allowBuilds:
@@ -55,82 +50,30 @@ allowBuilds:
 
 > This allowlist authorizes executing that package's code at install time — only allow source you trust, and prefer pinning a commit: `github:you/dsh-plugin-installer#<sha>`.
 
-Verify the config layer and boot:
+Restart `dsh web` once (the installer itself must enter the tree before it can work), then open `http://127.0.0.1:3080` → bottom-left **Settings** → **Plugins** → **安装** tab.
 
-```sh
-dsh --profile demo --dump-config   # should show a "# == dsh-plugin-installer" layer
-dsh --profile demo
-```
+> A `--patch` overlay only loads the plugin's **host half** (module resolution cannot reach package-level declarations), so the browser-half 安装 tab is invisible under an overlay; full functionality requires the profile install above.
 
-> Note: a custom-named profile (e.g. `demo`) contains only `dsh-base` and is **headless** (no GUI).
-> For the Web GUI and the config card below, use the `web` profile (`= dsh-base` + `dsh-web-app`) — see [testing the config card](#testing-the-config-card-in-the-gui).
+### Local development
 
-### Local development (modifying the plugin)
-
-From the root of a [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) source checkout, load this repo's source directly via an overlay (no install, no build):
+From the root of a [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) source checkout, load this repo's source directly via an overlay (no install, no build; host half only):
 
 ```sh
 pnpm dsh web --patch /absolute/path/to/dsh-plugin-installer/dev/cordis.yml
 ```
 
-Set `name` in `dev/cordis.yml` to this repo's absolute path on your machine, open `http://127.0.0.1:3080`, and ask the model to call the `greet` tool.
-
-> ⚠️ A `--patch` overlay only loads the plugin's **host half** (module resolution cannot reach package-level declarations).
-> To test the browser-half config card you must install into a profile (resolved by `name: dsh-plugin-installer`) — see the next section.
+Set `name` in `dev/cordis.yml` to this repo's absolute path on your machine.
 
 Run the checks yourself during development:
 
 ```sh
-pnpm install
+pnpm install --ignore-workspace   # this package is standalone; install its own deps
 pnpm typecheck
 pnpm build
 node test/smoke.mjs
 ```
 
-### Testing the config card (in the GUI)
-
-> The card is **disabled by default**: this bundle now ships the plugin installer only, and the demo plugin row (which hosts the card's settings namespace) is commented out in `cordis.patch.yml`. To try the card, re-enable the demo row there (rename its `id`, e.g. `dsh-plugin-installer-demo`, to avoid colliding with the installer row).
-
-The config card renders in the browser and depends on dsh's client-modules discovering the `dsh.client` declaration **by package name**, so the package must be installed into a profile (a `--patch` source path won't do):
-
-```sh
-# 1. Build (produces lib/index.js + lib/client.js)
-cd /path/to/dsh-plugin-installer && pnpm build
-
-# 2. Install into the web profile (= dsh-base + dsh-web-app, full GUI)
-dsh plugin --profile web add /path/to/dsh-plugin-installer
-
-# 3. Boot the web GUI (`dsh web` is equivalent to `dsh --profile web`)
-dsh web
-```
-
-Open `http://127.0.0.1:3080`:
-
-1. Bottom-left **Settings** → **Plugins** → **Configurable** tab: you should see a `dsh-plugin-installer` card with editable `greeting` / `maxRetries` / `verbose` fields;
-2. Change `greeting`, click **Save** — the status line should confirm it takes effect immediately;
-3. Back in a session, ask the model to call the `greet` tool — you should see the new greeting (the host half reads the resolved namespace value live, no restart);
-4. The change lands in the settings document (`settings.yaml` under `$DSH_HOME`) and survives restarts; to restore a default, edit the field back or clear it in the card.
-
-After editing `src/client.ts`, rerun `pnpm build` and refresh the page (the client bundle's rev query cache-busts).
-
-> ⚠️ **Known harness limitation (one-time setup, please read):** whether the card shows depends on the `WEB_SETTINGS_NAMESPACES` allowlist in harness's
-> `packages/host/apiproxy/src/api-proxy.ts` — a namespace absent from the list is treated as "not exposed" by `settings.describe` even when the plugin registered it, so the card does not render. Add one line to your harness checkout:
-
-```ts
-const WEB_SETTINGS_NAMESPACES = [
-  'agent-loop', 'shell', 'locale', 'permission', 'ui-conversation', 'ui-theme', 'web-search-deepseek',
-  'dsh-plugin-installer',   // ← add this line
-] as const
-```
-
-> This is the harness's current registration decision point (source comment: "adding a section to that page is a decision made here rather than by the registering plugin. Moving that declaration to `settings.register()` … is deferred work"). Once the harness moves the exposure declaration into `settings.register()`, the template no longer needs this line. The change is a local source edit: it is lost when you update/reinstall a fresh harness checkout and must be re-applied.
-
-## Plugin installer (in the GUI)
-
-The bundle also ships a **plugin installer** — install/remove profile plugins straight from the browser, no terminal needed. It wraps the exact same operation as `dsh plugin --profile <name> add/remove`:
-
-- Host half (`src/installer.ts`) registers a `POST /dsh-plugin-installer/api` route on the web server (`ctx.webServer`), forwards each request to `pnpm` inside the current profile directory, and reconciles `dsh.profile.bundles` against the installed state (same logic as the `dsh plugin` CLI: a dependency declaring `dsh.bundle` joins the layer stack; a removed or declaration-less one leaves it).
-- Browser half (`src/installer-client.ts`, registered by `src/client.ts` into the `settings.plugins.tab` slot) renders the **安装 (Install) tab** under Settings → Plugins: an install input, the current bundle layers with run/needs-restart badges, and per-bundle uninstall buttons.
+## Using the installer
 
 ```sh
 # After installing this bundle into the web profile and booting the GUI:
@@ -140,45 +83,44 @@ The bundle also ships a **plugin installer** — install/remove profile plugins 
 
 Install sources: npm package names (`dsh-my-plugin`), `github:user/repo`, `file:` links, and **absolute** paths to local directories/tarballs (relative paths are rejected — the browser has no working directory to anchor them to).
 
+### No-restart installs/uninstalls (hot activation)
+
+Installs take effect **without a restart by default**: after `pnpm add/remove` + reconciliation, the installer **rewrites the running tree's root-include patch list directly** — appending the new bundle's patch rows (or filtering out the removed bundle's rows), which the Loader applies transactionally so the plugin starts/stops immediately. This is fully self-contained; **no harness source change is needed** (dsh only hot-reloads `cordis.patch.yml` config patches; the bundle layer is frozen at boot, so editing `package.json` alone cannot avoid a restart).
+
+- When the install responds with `hot: true`, the status line reads "已热生效，无需重启" and the bundle row badge flips to "运行中";
+- If the live tree cannot apply the change (no Loader, no root include, or a failed update), it degrades to the old behavior: "重启 dsh 后生效" with a "需重启" badge — **a restart is always the fallback**, and after it the bundle is owned by `dsh.profile.bundles` as usual.
+
+Known limitations (all recoverable by restarting):
+
+- Hot-applied bundle rows are **appended to the end** of the running patch list. If you hand-edit `cordis.patch.yml` after a hot install but before a restart, dsh's config reload recomposes from the **boot-frozen bundle layer**, so the hot rows leave the live tree (the bundle row falls back to "需重启") until the next restart.
+- Before a restart, id-targeted overrides of a hot-installed bundle's rows in `cordis.patch.yml` (e.g. `disabled: true`) do not apply — patches apply in order and the user layer runs before the appended rows. After a restart the bundle-layer order takes over and overrides work normally.
+- Plugins with a browser half (`dsh.client`) need a **page refresh** after hot activation for their UI to be discovered (client-modules scans on page load).
+
+> When hot activation fails, the status line surfaces the Loader's error verbatim — **first check whether it is a plugin problem unrelated to hot activation** (e.g. a tool/route name collision: two copies of the same template both registering `greet`). Such conflicts fail on restart too; resolve the conflict first.
+
 Notes:
 
-- **Restart required to activate**: new bundles join the composition at boot. After an install, the row shows "需重启" until you restart `dsh`.
 - **pnpm must be on the harness process PATH.** Git installs run the package's `prepare` script; on pnpm ≥10 the first one is refused and the error surfaces the exact package key to add under `allowBuilds` in the profile's `pnpm-workspace.yaml` (the GUI shows the full pnpm output).
-- **No harness source edit needed** — unlike the config card above, the installer tab goes through the public `settings.plugins.tab` slot plus a plain web-server route, so it works on an unmodified harness checkout.
+- **No harness source edit needed** — the installer tab goes through the public `settings.plugins.tab` slot plus a plain web-server route, so it works on an unmodified harness checkout.
 - The host half only activates in profiles that mount `webServer` (the web profile). In headless profiles it disables itself instead of failing the boot.
 - The route is loopback-only (the web server binds `127.0.0.1`), and running it executes `pnpm` on your machine — same trust boundary as running `dsh plugin add` yourself.
 
-## Making it your own plugin
-
-1. Rename the package: keep `package.json` `name` (npm name, e.g. `dsh-my-plugin`), `src/index.ts` `name`, and `cordis.patch.yml` `id`/`name` consistent; when renaming the `./service` subpath, update `exports`/`files` too. **Renaming also touches three browser-half spots:** the client bundle `id` in `tsdown.config.ts` (`__ModuleLoader__.load({ id })`), `NAMESPACE` in `src/client.ts`, and `dsh.client` in `package.json` (if you need `inject`).
-2. Change the `Config` interface and `Config` schema: anything two deployments should be able to set differently must be a config field ([design principles](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/config.md#design-principles)). The config is wired to the settings namespace — does the GUI card auto-render a form from your schema? No: the card in `src/client.ts` is hand-written; add a field row there for each new config field.
-3. Register your tool in `apply`: `ctx.tools.register(defineTool({...}))`; `execute` returns the canonical value declared by `output.schema`, and `output.render` is the pure function for model-visible rendering ([tool reference](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/cookbook/adding-a-tool.md)).
-4. To provide capabilities to other plugins, enable `src/service.ts` and uncomment its row in `cordis.patch.yml`.
-5. Remember to `declare module '@deepseek-ai/cordis'` to merge `Context` / `Events` types — that is what keeps cross-package boundaries type-safe.
-6. To intercept tool calls, act as a permission gate, or respond to system hooks, enable `src/hook.ts` (uncomment its `cordis.patch.yml` row): `ctx.on('tools/pre-execute', ...)` returns `{ kind: 'deny', reason }` or calls `next()` to allow ([extension cookbook](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/cookbook/extension-cookbook.md)).
-7. Config reads: every read in `src/index.ts` goes through `configSource()` (the resolved settings-namespace value, falling back to the composition entry). If you derive registration-level facts from config in `apply` (e.g. register different tools by config), rebuild them in `installSettingsSection`'s `onChange` rather than reading only at execution points (see [bash-local](https://github.com/deepseek-ai/deepseek-harness/blob/main/packages/shell/bash-local/src/index.ts)).
-
 ## How the browser half works
 
-- `package.json` declares `dsh.client: { platform: "web" }` + `exports["./client"]` → dsh's client-modules discovers it and loads `lib/client.js` as a browser plugin;
-- `src/client.ts` registers a card in the `settings.plugin.item` slot and binds the `dsh-plugin-installer` namespace via the `settingsScope` service: reads snapshots, stages drafts, and writes field-by-field on save (revision-fenced);
-- `src/installer-client.ts` registers the installer tab in the `settings.plugins.tab` slot and calls the host half through a same-origin `fetch` to `/dsh-plugin-installer/api`;
-- the host half (`src/index.ts`) registers the same namespace with `installSettingsSection` (the cordis.yml config is the `base` layer) and reads the resolved value lazily in the tool → saving takes effect immediately;
-- at runtime the client half depends only on `react` (provided by the browser platform module table); everything else goes through `ctx` services and no `@deepseek-ai` client package is imported — keep that discipline when editing the template.
+- `package.json` declares `dsh.client: { platform: "web" }` + `exports["./client"]` → dsh's client-modules discovers `lib/client.js` and loads it as a browser plugin;
+- **Discovery carrier**: client-modules resolves package.json by the Loader entry name (`require.resolve('<entry-name>/package.json')`), so `cordis.patch.yml` must keep one row whose `name` equals the package name itself (`dsh-plugin-installer`, backed by `src/index.ts`, a no-op) — only then does the browser load `lib/client.js`;
+- `src/client.ts` registers the 安装 tab in the `settings.plugins.tab` slot; `src/installer-client.ts` calls the host half through a same-origin `fetch` to `/dsh-plugin-installer/api`;
+- the host half (`src/installer.ts`) registers that route via `ctx.webServer`, forwards pnpm, reconciles the bundle layers, and performs the no-restart hot activation;
+- at runtime the client half depends only on `react` (provided by the browser platform module table); everything else goes through `ctx` services and no `@deepseek-ai` client package is imported — keep that discipline when editing.
+
+## Making it your own installer (fork)
+
+- Rename the package: keep `package.json` `name`, `src/index.ts` `name`, and both rows' `name`/`id` in `cordis.patch.yml` consistent. **Renaming also touches the browser-half spots:** the client bundle `id` in `tsdown.config.ts` (`__ModuleLoader__.load({ id })`), `dsh.client` in `package.json`, and the slot id in `src/client.ts`.
+- Change the install target / command: edit `runPnpm` calls and `ROUTE_PREFIX` in `src/installer.ts`.
+- Remember to `declare module '@deepseek-ai/cordis'` to merge `Context` / `Events` types — that is what keeps cross-package boundaries type-safe.
 
 ## Publishing
 
 - **npm**: `pnpm publish` (`files` already includes the build output and the patch; no extra steps)
-- **tarball**: `pnpm pack`, then `dsh plugin --profile demo add ./dsh-plugin-installer-0.1.0.tgz`
+- **tarball**: `pnpm pack`, then `dsh plugin --profile web add ./dsh-plugin-installer-0.1.0.tgz`
 - **git**: `dsh plugin add github:you/dsh-plugin-installer` (combined with the `allowBuilds` step above)
-
-## Related docs
-
-- Plugin development intro: [basic/index.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/index.md)
-- Plugin config: [basic/config.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/config.md)
-- Tool development: [basic/tool.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/tool.md)
-- Packaging & installation: [basic/publish.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md)
-- Plugins & lifecycle: [framework/index.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/index.md)
-- Services & dependencies: [framework/service.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/service.md)
-- Event system: [framework/events.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/events.md)
-- Cordis tutorial: [cordis-tutorial](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/cordis-tutorial/index.md)

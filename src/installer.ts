@@ -26,6 +26,7 @@ import { createRequire } from 'node:module'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import * as yaml from 'js-yaml'
 import type { Context } from '@deepseek-ai/cordis'
 
 export const name = 'dsh-plugin-installer/installer'
@@ -104,6 +105,11 @@ export interface InstallerChangeValue {
   activated?: string[]
   /** 本次移除的依赖名（remove）。 */
   removed?: string[]
+  /**
+   * 本次变更是否已热应用到运行中的配置树（true = 已生效，无需重启；
+   * false / 缺省 = 已落盘，重启 dsh 后生效）。
+   */
+  hot?: boolean
   /** reconcile 提示（如"未声明 dsh.bundle，仅作普通依赖"）。 */
   warning?: string | undefined
 }
@@ -117,9 +123,19 @@ interface WebServerLike {
   }): () => void
 }
 
-/** Loader 服务的最小结构面（用于标记 bundle 是否已挂载）。 */
+/** Loader 条目最小结构面（用于热激活时改写根 include 的补丁列表）。 */
+interface LoaderEntryLike {
+  options: {
+    id?: string
+    name?: string
+    config?: { path?: string; patches?: unknown[] }
+  }
+  update?(options: { config: { path?: string; patches?: unknown[] } }): Promise<void>
+}
+
+/** Loader 服务的最小结构面（用于标记 bundle 是否已挂载 + 热激活）。 */
 interface LoaderLike {
-  entries(): ReadonlyArray<{ options: { name?: string } }>
+  entries(): ReadonlyArray<LoaderEntryLike>
 }
 
 /** 路由前缀；客户端 fetch 的完整路径是 `${this}/api`。 */
@@ -222,6 +238,159 @@ function reconcilePlugins(before: ProfileManifest, profileDir: string): string[]
   return warnings
 }
 
+// ---- 免重启热激活 ----
+//
+// dsh 的运行中配置树是根 include 条目（id 固定为 `include`，见 harness
+// `mountRootInclude`）上的一份补丁列表：bundle 层（package.json 的
+// `dsh.profile.bundles`）+ profile 的 cordis.patch.yml + 用户层 + overlay，
+// 全部拼成一个扁平列表。dsh 只对 cordis.patch.yml 的改动做配置热重载
+// （HMR），bundle 层在启动时冻结 —— 因此仅靠改 package.json 无法免重启。
+//
+// 这里的自包含方案：安装/卸载成功后，**直接改写根 include 的补丁列表**，
+// 把新 bundle 的补丁行追加进去（或把已卸载 bundle 的补丁行过滤掉），再等
+// Loader 事务性应用 —— 新插件即刻激活/销毁，无需重启，也不依赖任何
+// harness 源码改动。局限（见 README）：之后用户手工编辑 cordis.patch.yml
+// 触发的重载仍以启动时的 bundle 层为准，热装的 bundle 会退回"需重启"
+// 状态，重启后由 package.json 的 bundles 列表接管。
+
+/** 根 include 条目的固定 id（与 harness mountRootInclude 的 pin 一致）。 */
+const ROOT_INCLUDE_ID = 'include'
+
+/** 热激活等待 Loader 反映变更的总时限。 */
+const HOT_WAIT_MS = 6_000
+/** 热激活轮询 Loader 的间隔。 */
+const HOT_POLL_MS = 150
+
+// include 的 entry-list YAML 方言：`!!js` 标量往返为 `{ __jsExpr }` 表达式
+// 节点（与 @deepseek-ai/cordis-plugin-include 的 entryListSchema 同构，
+// 本地复刻以避免引入运行时依赖；js-yaml 同主版本，解析结构一致）。
+const JsExpr = new yaml.Type('tag:yaml.org,2002:js', {
+  kind: 'scalar',
+  resolve: (data: unknown) => typeof data === 'string',
+  construct: (data: unknown) => ({ __jsExpr: data }),
+  predicate: (value: unknown) => value instanceof Object && '__jsExpr' in (value as Record<string, unknown>),
+  represent: (data: object) => (data as Record<string, unknown>)['__jsExpr'] as string,
+})
+const entryListSchema = yaml.JSON_SCHEMA.extend(JsExpr)
+
+/** 解析一个 bundle 的 patch 文件（与 loadOverlayPatches 同语义；导出供冒烟测试）。 */
+export function parsePatchFile(path: string): Array<Record<string, unknown>> {
+  const parsed = yaml.load(readFileSync(path, 'utf8'), { schema: entryListSchema })
+  if (!Array.isArray(parsed)) {
+    throw new Error(`dsh-plugin-installer: patch file ${path} must be a top-level YAML array`)
+  }
+  return parsed as Array<Record<string, unknown>>
+}
+
+/** 解析一个 bundle 的 `dsh.bundle.patch` 文件路径；非 bundle 或缺文件时缺省。 */
+function bundlePatchPath(profileDir: string, packageName: string): string | undefined {
+  const dir = packageDirFromAnchor(join(profileDir, 'package.json'), packageName)
+  if (dir === undefined) return undefined
+  const patch = readManifest(dir).dsh?.bundle?.patch
+  return patch === undefined ? undefined : join(dir, patch)
+}
+
+/** 顺序无关的结构深比较（用于从运行中补丁列表里过滤出某 bundle 的行）。 */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a)) {
+    const left = a as unknown[]
+    const right = b as unknown[]
+    return left.length === right.length && left.every((item, index) => deepEqual(item, right[index]))
+  }
+  const left = a as Record<string, unknown>
+  const right = b as Record<string, unknown>
+  const keys = Object.keys(left)
+  return keys.length === Object.keys(right).length && keys.every((key) => deepEqual(left[key], right[key]))
+}
+
+/** 当前运行树中是否已有该包名的 Loader 条目（精确名或 `包名/子路径`）。 */
+function hasLoadedName(packageName: string, names: ReadonlySet<string>): boolean {
+  for (const name of names) {
+    if (name === packageName || name.startsWith(`${packageName}/`)) return true
+  }
+  return false
+}
+
+/** 找到根 include 条目（其 config.patches 承载整棵树的补丁组合）。 */
+function rootIncludeEntry(loader: LoaderLike | undefined): LoaderEntryLike | undefined {
+  if (loader === undefined) return undefined
+  return [...loader.entries()].find((entry) => entry.options.id === ROOT_INCLUDE_ID)
+}
+
+/** 轮询 Loader 直到断言成立或超时。 */
+async function waitForLoadState(
+  loader: LoaderLike | undefined,
+  check: (names: ReadonlySet<string>) => boolean,
+): Promise<boolean> {
+  if (loader === undefined) return false
+  const deadline = Date.now() + HOT_WAIT_MS
+  while (Date.now() < deadline) {
+    const names = new Set(
+      [...loader.entries()].map((entry) => entry.options.name).filter((name): name is string => name !== undefined),
+    )
+    if (check(names)) return true
+    await new Promise((resolve) => setTimeout(resolve, HOT_POLL_MS))
+  }
+  return false
+}
+
+/**
+ * 热激活安装：把新增 bundle 的补丁行追加进根 include 的补丁列表并等待应用。
+ * @returns 是否已确认热生效；false = 需要重启（无 Loader / 非 include 树 / 更新失败）。
+ */
+export async function hotApplyInstall(
+  loader: LoaderLike | undefined,
+  profileDir: string,
+  activated: readonly string[],
+): Promise<boolean> {
+  const entry = rootIncludeEntry(loader)
+  if (entry === undefined || entry.update === undefined) return false
+  const current = entry.options.config
+  const additions: Array<Record<string, unknown>> = []
+  for (const packageName of activated) {
+    const patchPath = bundlePatchPath(profileDir, packageName)
+    if (patchPath === undefined) continue // 解析不到（极端竞态）→ 跳过该包
+    additions.push(...parsePatchFile(patchPath))
+  }
+  if (additions.length === 0) return true // 没有需要激活的行，无需改写
+  await entry.update({
+    config: {
+      ...(current ?? {}),
+      patches: [...(current?.patches ?? []), ...additions],
+    },
+  })
+  return true
+}
+
+/**
+ * 热激活卸载：把已卸载 bundle 的补丁行从根 include 的补丁列表里过滤掉并等待应用。
+ * @param removedPatches - pnpm remove 之前解析的该 bundle 的补丁行（卸载后文件已不在磁盘）。
+ */
+export async function hotApplyRemove(
+  loader: LoaderLike | undefined,
+  removedPatches: readonly Record<string, unknown>[],
+): Promise<boolean> {
+  const entry = rootIncludeEntry(loader)
+  if (entry === undefined || entry.update === undefined) return false
+  const current = entry.options.config
+  const currentPatches = current?.patches ?? []
+  if (removedPatches.length === 0 || currentPatches.length === 0) return true
+  const next = currentPatches.filter(
+    (patch) => !removedPatches.some((removed) => deepEqual(patch, removed)),
+  )
+  if (next.length === currentPatches.length) return true // 没有命中该 bundle 的行
+  await entry.update({
+    config: {
+      ...(current ?? {}),
+      patches: next,
+    },
+  })
+  return true
+}
+
 // ---- pnpm 执行 ----
 
 /** 在 profile 目录里运行一次 pnpm，收集 stdout+stderr 与退出码。 */
@@ -275,8 +444,12 @@ function list(profileDir: string, loader: LoaderLike | undefined): InstallerList
   return { profileName: basename(profileDir), profileDir, bundles, dependencies }
 }
 
-/** install：pnpm add + 对账层列表。返回新增/激活的包名与提示。 */
-async function install(spec: string, profileDir: string): Promise<InstallerResponse<InstallerChangeValue>> {
+/** install：pnpm add + 对账层列表 + 热激活。返回新增/激活的包名与提示。 */
+async function install(
+  spec: string,
+  profileDir: string,
+  loader: LoaderLike | undefined,
+): Promise<InstallerResponse<InstallerChangeValue>> {
   const trimmed = spec.trim()
   if (trimmed === '') return { ok: false, error: { code: 'bad-request', message: '安装源不能为空' } }
   if (/^\.{1,2}(?:[/\\]|$)/.test(trimmed)) {
@@ -303,22 +476,60 @@ async function install(spec: string, profileDir: string): Promise<InstallerRespo
   const beforeNames = new Set(Object.keys(before.dependencies ?? {}))
   const added = Object.keys(after.dependencies ?? {}).filter((name) => !beforeNames.has(name))
   const activated = added.filter((name) => (after.dsh?.profile?.bundles ?? []).includes(name))
-  return {
-    ok: true,
-    value: {
-      output,
-      added,
-      activated,
-      warning: warnings.length > 0 ? warnings.join('\n') : undefined,
-    },
+  const value: InstallerChangeValue = {
+    output,
+    added,
+    activated,
+    warning: warnings.length > 0 ? warnings.join('\n') : undefined,
   }
+  if (activated.length > 0) {
+    // 热激活：改写根 include 的补丁列表，让新 bundle 的行立即进树；失败不致命，
+    // 回退为"重启后生效"（与旧行为一致），提示里说明原因。
+    try {
+      const applied = await hotApplyInstall(loader, profileDir, activated)
+      if (applied) {
+        value.hot = await waitForLoadState(
+          loader,
+          (names) => activated.some((packageName) => hasLoadedName(packageName, names)),
+        )
+      }
+      if (value.hot !== true) {
+        value.warning = [
+          ...(value.warning !== undefined ? [value.warning] : []),
+          '已写入 profile，但运行中的配置树未确认热生效（可能正在应用，或缺少 Loader/include）—— 若持续未生效，请重启 dsh',
+        ].join('\n')
+      }
+    } catch (error) {
+      value.warning = [
+        ...(value.warning !== undefined ? [value.warning] : []),
+        `热激活失败（${String(error)}）—— 该插件未激活，且重启时同样会遇到此问题（错误若与热激活无关，如工具名/路由冲突，请先解决冲突）`,
+      ].join('\n')
+    }
+  } else {
+    value.hot = true // 没有 bundle 层需要激活，无变更即已生效
+  }
+  return { ok: true, value }
 }
 
-/** remove：pnpm remove + 对账层列表。 */
-async function remove(packageName: string, profileDir: string): Promise<InstallerResponse<InstallerChangeValue>> {
+/** remove：pnpm remove + 对账层列表 + 热卸载。 */
+async function remove(
+  packageName: string,
+  profileDir: string,
+  loader: LoaderLike | undefined,
+): Promise<InstallerResponse<InstallerChangeValue>> {
   const trimmed = packageName.trim()
   if (trimmed === '') return { ok: false, error: { code: 'bad-request', message: '包名不能为空' } }
   const before = readManifest(profileDir)
+  // pnpm remove 会删掉包文件；先解析该 bundle 的补丁行，供热卸载过滤用。
+  let removedPatches: Array<Record<string, unknown>> = []
+  const patchPath = bundlePatchPath(profileDir, trimmed)
+  if (patchPath !== undefined) {
+    try {
+      removedPatches = parsePatchFile(patchPath)
+    } catch {
+      removedPatches = [] // 解析失败按无行处理（非 bundle 或损坏文件）
+    }
+  }
   const { code, output } = await runPnpm(profileDir, ['remove', trimmed])
   if (code !== 0) {
     return { ok: false, error: { code: 'remove-failed', message: `pnpm remove 失败（退出码 ${code}）`, output } }
@@ -326,14 +537,36 @@ async function remove(packageName: string, profileDir: string): Promise<Installe
   const warnings = reconcilePlugins(before, profileDir)
   const afterNames = new Set(Object.keys(readManifest(profileDir).dependencies ?? {}))
   const removed = Object.keys(before.dependencies ?? {}).filter((name) => !afterNames.has(name))
-  return {
-    ok: true,
-    value: {
-      output,
-      removed,
-      warning: warnings.length > 0 ? warnings.join('\n') : undefined,
-    },
+  const value: InstallerChangeValue = {
+    output,
+    removed,
+    warning: warnings.length > 0 ? warnings.join('\n') : undefined,
   }
+  if (removed.length > 0) {
+    try {
+      const applied = await hotApplyRemove(loader, removedPatches)
+      if (applied) {
+        value.hot = await waitForLoadState(
+          loader,
+          (names) => !removed.some((name) => hasLoadedName(name, names)),
+        )
+      }
+      if (value.hot !== true) {
+        value.warning = [
+          ...(value.warning !== undefined ? [value.warning] : []),
+          '已从 profile 移除，但运行中的配置树未确认热生效（可能正在应用，或缺少 Loader/include、更新失败）—— 重启 dsh 后完全生效',
+        ].join('\n')
+      }
+    } catch (error) {
+      value.warning = [
+        ...(value.warning !== undefined ? [value.warning] : []),
+        `热卸载失败（${String(error)}）—— 重启 dsh 后完全生效`,
+      ].join('\n')
+    }
+  } else {
+    value.hot = true // 没有依赖被移除，无变更即已生效
+  }
+  return { ok: true, value }
 }
 
 /**
@@ -351,9 +584,9 @@ export async function handleInstallerRequest(
     case 'list':
       return { ok: true, value: list(profileDir, loader) }
     case 'install':
-      return install(request.spec ?? '', profileDir)
+      return install(request.spec ?? '', profileDir, loader)
     case 'remove':
-      return remove(request.packageName ?? '', profileDir)
+      return remove(request.packageName ?? '', profileDir, loader)
     default:
       return {
         ok: false,

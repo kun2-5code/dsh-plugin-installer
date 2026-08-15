@@ -7,7 +7,7 @@ import { defineConfig } from 'tsdown'
 
 /** Host 半边：Node 库，输出 lib/，供 cordis.yml 插件行按包名加载。 */
 const lib = {
-  entry: ['src/index.ts', 'src/service.ts', 'src/hook.ts', 'src/installer.ts'],
+  entry: ['src/index.ts', 'src/installer.ts'],
   outDir: 'lib',
   format: ['esm'],
   platform: 'node',

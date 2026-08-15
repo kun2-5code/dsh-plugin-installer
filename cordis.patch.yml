@@ -1,28 +1,11 @@
 # dsh-plugin-installer 的 bundle 层：安装进 profile 后由 dsh 加载。
-# 每个条目对应一个插件模块；后层按 id 覆盖前层，覆盖整行 config 而非深合并。
 - insert:
     # ⚠️ 客户端半边发现载体（必须保留）：harness 的 client-modules 按 Loader 条目
-    # 名解析 package.json（require.resolve('<条目名>/package.json')），因此 bundle
-    # 必须至少有一行 name 等于包名本身，浏览器才会加载 lib/client.js（「安装」tab）。
-    # 这一行同时是示例主插件（greet 工具 + 配置卡片，见 src/index.ts）。想精简的话
-    # 可以改 src/index.ts 的内容，但请保留 name 与这一行。
-    - id: dsh-plugin-installer-demo
+    # 名解析 package.json（require.resolve('<条目名>/package.json')），因此必须
+    # 有一行 name 等于包名本身，浏览器才会加载 lib/client.js（「安装」tab）。
+    # 宿主侧为空实现（见 src/index.ts）；安装器真正的逻辑在下面的子路径行。
+    - id: dsh-plugin-installer-client
       name: dsh-plugin-installer
-      config:
-        greeting: 'Hello from dsh-plugin-installer'
-        maxRetries: 3
-        verbose: false
-    #
-    # 可选：示例 Service 插件（见 src/service.ts）。需要时删除下面两行注释，
-    # 并确保构建产物 lib/service.js 存在（tsdown 已包含该入口）。
-    # - id: dsh-plugin-installer-service
-    #   name: 'dsh-plugin-installer/service'
-    #
-    # 可选：hook 权限门插件（见 src/hook.ts）。需要时删除下面两行注释。
-    # - id: dsh-plugin-installer-permission-gate
-    #   name: 'dsh-plugin-installer/hook'
-    #   config:
-    #     denyTools: ['bash']
     #
     # 插件安装器宿主半侧（见 src/installer.ts）：在 设置 → 插件 → 安装 里
     # 直接安装/卸载 profile 插件，无需打开 CLI。仅在装有 webServer 服务的

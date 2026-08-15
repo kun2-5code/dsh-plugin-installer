@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-installer",
   "version": "0.1.0",
-  "description": "A starter template for DeepSeek Harness (dsh) plugins: GUI-editable config, tools, events, services, hooks, and a browser client half in one installable bundle.",
+  "description": "A plugin installer for DeepSeek Harness (dsh) web: install/remove profile plugins straight from the browser GUI, with no-restart hot activation.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -9,14 +9,6 @@
     ".": {
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
-    },
-    "./service": {
-      "types": "./lib/service.d.ts",
-      "default": "./lib/service.js"
-    },
-    "./hook": {
-      "types": "./lib/hook.d.ts",
-      "default": "./lib/hook.js"
     },
     "./installer": {
       "types": "./lib/installer.d.ts",
@@ -28,13 +20,9 @@
   },
   "files": [
     "lib/index.js",
-    "lib/service.js",
-    "lib/hook.js",
     "lib/installer.js",
     "lib/client.js",
     "lib/index.d.ts",
-    "lib/service.d.ts",
-    "lib/hook.d.ts",
     "lib/installer.d.ts",
     "cordis.patch.yml"
   ],
@@ -62,22 +50,19 @@
     "dsh",
     "cordis",
     "plugin",
-    "template"
+    "installer"
   ],
   "license": "MIT",
   "dependencies": {
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.5",
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "js-yaml": "^4.1.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.5",
     "react": "^18.0.0 || ^19.0.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.20.0",
     "@types/react": "^18.3.0",
     "tsdown": "^0.22.2",

@@ -1,101 +1,23 @@
-// 构建产物冒烟测试：验证主插件注册 greet 工具、配置经 settings 命名空间实时接线、
-// hook 权限门按配置拒绝/放行、插件安装器宿主半侧（webServer 路由 + API 方法）。
+// 构建产物冒烟测试：验证主入口（client 发现载体）为空实现、插件安装器宿主
+// 半侧（webServer 路由 + API 方法 + 免重启热激活）。
 // 运行：node test/smoke.mjs（先 pnpm build）
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { name, inject, apply } from '../lib/index.js'
-import * as hook from '../lib/hook.js'
-import { apply as applyInstaller, handleInstallerRequest, ROUTE_PREFIX } from '../lib/installer.js'
+import { name, apply } from '../lib/index.js'
+import {
+  apply as applyInstaller,
+  handleInstallerRequest,
+  hotApplyInstall,
+  hotApplyRemove,
+  parsePatchFile,
+  ROUTE_PREFIX,
+} from '../lib/installer.js'
 
-// 最小可用的 ctx：只实现本插件用到的成员。
-// inject 存在但从不提供服务 —— 模拟"profile 里没有 settings 服务"，
-// 此时 installSettingsSection 不执行，配置回退到 composition entry。
-const registered = []
-const ctx = {
-  tools: {
-    register(definition) {
-      registered.push(definition)
-    },
-  },
-  on() {
-    return () => {}
-  },
-  effect() {
-    return () => {}
-  },
-  inject() {
-    return () => {}
-  },
-}
-
-const config = { greeting: 'Hi', maxRetries: 5 }
-apply(ctx, config)
-
+// 主入口（包名载体行）：只负责 client 半边发现，apply 应为空实现、不抛错。
 assert.equal(name, 'dsh-plugin-installer')
-assert.deepEqual(inject, ['tools'])
-
-const tool = registered.find((t) => t.name === 'greet')
-assert.ok(tool, 'greet tool should be registered')
-assert.equal(await tool.execute({ name: 'Ada' }), 'Hi, Ada!')
-
-// settings 接线：模拟 settings 服务存在（installSettingsSection 的依赖立即满足），
-// 断言 greet 工具实时读取命名空间的解析值，而不是静态配置。
-{
-  let liveValue = { greeting: 'Hey', maxRetries: 3 }
-  const settingsCtx = {
-    settings: {
-      register(ns, schema, options) {
-        assert.equal(ns, 'dsh-plugin-installer')
-        assert.equal(options.base, config, 'composition entry 应作为 base 层传入')
-        return {
-          get() {
-            return liveValue
-          },
-          watch() {
-            return () => {}
-          },
-        }
-      },
-    },
-    effect() {
-      return () => {}
-    },
-  }
-  const liveRegistered = []
-  const liveCtx = {
-    tools: { register(d) { liveRegistered.push(d) } },
-    on() { return () => {} },
-    effect() { return () => {} },
-    inject(_names, callback) {
-      callback(settingsCtx)
-      return () => {}
-    },
-  }
-  apply(liveCtx, config)
-  const liveTool = liveRegistered.find((t) => t.name === 'greet')
-  assert.ok(liveTool, 'greet tool should be registered')
-  assert.equal(await liveTool.execute({ name: 'Bob' }), 'Hey, Bob!')
-  liveValue = { greeting: 'Yo', maxRetries: 1 }
-  assert.equal(await liveTool.execute({ name: 'Bob' }), 'Yo, Bob!', '配置变更应实时生效')
-}
-
-// hook 权限门：捕获注册的 tools/pre-execute 监听器，验证拒绝与放行两条路径。
-let listener
-const hookCtx = {
-  on(_event, fn) {
-    listener = fn
-  },
-}
-hook.apply(hookCtx, { denyTools: ['bash'] })
-assert.ok(listener, 'tools/pre-execute listener should be registered')
-
-const denied = await listener({ name: 'bash' }, () => Promise.resolve({ kind: 'allow' }))
-assert.deepEqual(denied, { kind: 'deny', reason: 'Tool "bash" is denied by policy.' })
-
-const allowed = await listener({ name: 'greet' }, () => Promise.resolve({ kind: 'allow' }))
-assert.deepEqual(allowed, { kind: 'allow' })
+assert.doesNotThrow(() => apply({}), 'carrier apply should be a no-op')
 
 // 插件安装器宿主半侧：临时 profile 目录 + 伪 ctx（webServer 捕获路由注册）。
 {
@@ -216,6 +138,71 @@ assert.deepEqual(allowed, { kind: 'allow' })
 
     // 清理主用例的定时器与路由。
     for (const dispose of disposers) dispose()
+  } finally {
+    rmSync(profileDir, { recursive: true, force: true })
+  }
+}
+
+// 免重启热激活：直接改写根 include（id 固定为 `include`）的补丁列表，
+// 无需任何 harness 改动即可让新 bundle 立即进树 / 卸载后立即出树。
+{
+  const profileDir = mkdtempSync(join(tmpdir(), 'dsh-hot-apply-'))
+  try {
+    writeFileSync(join(profileDir, 'package.json'), JSON.stringify({
+      name: 'dsh-profile-hot',
+      private: true,
+      dependencies: {},
+      dsh: { profile: { bundles: [] } },
+    }, undefined, 2) + '\n')
+
+    // 假 bundle 包：声明 dsh.bundle.patch，patch 文件里既有 insert 行也含
+    // 一个 !!js 表达式节点（验证 include 方言解析）。
+    const fakePkgDir = join(profileDir, 'node_modules', 'dsh-fake-plugin')
+    mkdirSync(fakePkgDir, { recursive: true })
+    writeFileSync(join(fakePkgDir, 'package.json'), JSON.stringify({
+      name: 'dsh-fake-plugin',
+      version: '0.1.0',
+      dsh: { bundle: { patch: './cordis.patch.yml' } },
+    }))
+    writeFileSync(join(fakePkgDir, 'cordis.patch.yml'), [
+      '- insert:',
+      '    - id: fake-row',
+      '      name: dsh-fake-plugin',
+      '      config:',
+      '        greeting: !!js "process.env.DSH_FAKE_GREETING || \'hi\'"',
+      '',
+    ].join('\n'))
+
+    // 1) 安装：新 bundle 的补丁行应追加进根 include 的补丁列表并调用 update。
+    let updatedConfig
+    const entryWithUpdate = {
+      options: { id: 'include', name: 'cordis:include', config: { path: 'file:///x/cordis.yml', patches: [] } },
+      async update(options) { updatedConfig = options.config },
+    }
+    const applied = await hotApplyInstall({ entries: () => [entryWithUpdate] }, profileDir, ['dsh-fake-plugin'])
+    assert.equal(applied, true, 'hotApplyInstall should apply')
+    assert.equal(updatedConfig.patches.length, 1, 'new bundle patches should be appended')
+    assert.equal(updatedConfig.patches[0].insert[0].id, 'fake-row')
+    assert.equal(updatedConfig.patches[0].insert[0].config.greeting.__jsExpr.includes('DSH_FAKE_GREETING'), true,
+      '!!js 表达式应按 include 方言解析为 { __jsExpr } 节点')
+
+    // 2) 卸载：从运行中的补丁列表过滤掉该 bundle 的行。removedPatches 用
+    //    fresh 解析（模拟 pnpm remove 前的磁盘状态），与运行中的克隆结构匹配。
+    let removedConfig
+    const removedEntry = {
+      options: { id: 'include', name: 'cordis:include', config: { path: 'file:///x/cordis.yml', patches: updatedConfig.patches } },
+      async update(options) { removedConfig = options.config },
+    }
+    const removed = await hotApplyRemove(
+      { entries: () => [removedEntry] },
+      parsePatchFile(join(fakePkgDir, 'cordis.patch.yml')),
+    )
+    assert.equal(removed, true, 'hotApplyRemove should apply')
+    assert.equal(removedConfig.patches.length, 0, 'removed bundle rows should be filtered out')
+
+    // 3) 无根 include（非 profile 树 / 无 Loader）：返回 false（调用方回退为"需重启"）。
+    const noTree = await hotApplyInstall({ entries: () => [] }, profileDir, ['dsh-fake-plugin'])
+    assert.equal(noTree, false, 'hotApplyInstall without a root include should report not-applied')
   } finally {
     rmSync(profileDir, { recursive: true, force: true })
   }

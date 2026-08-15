@@ -56,6 +56,8 @@ export interface InstallerChange {
   added?: string[]
   activated?: string[]
   removed?: string[]
+  /** 是否已热应用到运行中的配置树（true = 已生效，无需重启）。 */
+  hot?: boolean
   warning?: string | undefined
 }
 
@@ -150,9 +152,12 @@ export function InstallerTab({ api }: { api: InstallerApi }): React.ReactElement
       (change) => {
         const activated = change.activated ?? []
         const added = change.added ?? []
+        const hot = change.hot === true
         const parts: string[] = []
         if (activated.length > 0) {
-          parts.push(`已安装并激活 bundle：${activated.join('、')} —— 重启 dsh 后生效`)
+          parts.push(hot
+            ? `已安装并激活 bundle：${activated.join('、')}（已热生效，无需重启）`
+            : `已安装并激活 bundle：${activated.join('、')}（重启 dsh 后生效）`)
         } else if (added.length > 0) {
           parts.push(`已安装：${added.join('、')}（未激活为配置层）`)
         } else {
@@ -176,9 +181,14 @@ export function InstallerTab({ api }: { api: InstallerApi }): React.ReactElement
     void api.remove(packageName).then(
       (change) => {
         const removed = change.removed ?? []
+        const hot = change.hot === true
         setMessage({
           kind: 'info',
-          text: removed.length > 0 ? `已卸载：${removed.join('、')}（重启 dsh 后完全生效）` : '卸载完成',
+          text: removed.length > 0
+            ? hot
+              ? `已卸载：${removed.join('、')}（已热生效，无需重启）`
+              : `已卸载：${removed.join('、')}（重启 dsh 后完全生效）`
+            : '卸载完成',
           output: change.output,
         })
         refresh()
@@ -197,7 +207,8 @@ export function InstallerTab({ api }: { api: InstallerApi }): React.ReactElement
       { className: 'dsi-intro' },
       '在 profile 里安装/卸载插件（等价于 `dsh plugin add/remove`）。',
       '安装源支持 npm 包名、github:user/repo、file: 链接、tarball/目录的绝对路径；',
-      '安装后需重启 dsh 让新 bundle 生效。需要 pnpm 在 dsh 进程的 PATH 上。',
+      '安装/卸载会热更新运行中的配置（无需重启）；热更新失败时才需要重启 dsh。',
+      '需要 pnpm 在 dsh 进程的 PATH 上。',
     ),
     React.createElement(
       'div',

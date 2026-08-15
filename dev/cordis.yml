@@ -6,15 +6,9 @@
 # 把下面的 name 改成这个仓库在你机器上的绝对路径。
 #
 # 注意：overlay 只加载 host 半边（模块解析到源码文件，发现不了 dsh.client 包级声明）。
-# 要测试浏览器半边的配置卡片（src/client.ts），必须把包安装进 profile：
+# 要测试浏览器半边的「安装」tab，必须把包安装进 profile：
 #   pnpm dsh plugin --profile web add /absolute/path/to/dsh-plugin-installer && pnpm dsh web
 - insert:
-    # 示例主插件（greet 工具，见 src/index.ts）：dev 下同时挂示例与安装器。
-    - id: dsh-plugin-installer-demo
-      name: '/absolute/path/to/dsh-plugin-installer/src/index.ts'
-      config:
-        greeting: 'Hello from dev overlay'
-        verbose: true
     # 插件安装器宿主半侧（见 src/installer.ts）：dev overlay 下同样可用
     # （web profile 已挂载 webServer；浏览器半边仍须装进 profile 才能看到 tab）。
     - id: dsh-plugin-installer
